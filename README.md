@@ -7,7 +7,7 @@ This directory is for converting long screenshots into print-friendly PDFs:
 3. Intelligently split long images into multi-page PDFs, avoiding cuts through text or questions as much as possible.
 4. Optionally add small page numbers to the bottom-right corner of each PDF page.
 
-## Current Example Files
+## Example
 
 - `IMG_1749_print_friendly_no_frames.jpg`: processed long image.
 - `IMG_1749_print_friendly_no_frames_smart_split.pdf`: intelligently split PDF without page numbers.
