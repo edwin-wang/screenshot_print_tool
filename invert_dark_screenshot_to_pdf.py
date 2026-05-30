@@ -120,6 +120,296 @@ def remove_dark_regions_keep_text(original_rgb, rgb, threshold=135):
     return output
 
 
+def invert_continuous_dark_regions(rgb, threshold=70):
+    arr = rgb.copy()
+    work = rgb.astype(np.float32)
+    luma = 0.2126 * work[:, :, 0] + 0.7152 * work[:, :, 1] + 0.0722 * work[:, :, 2]
+    dark = luma < threshold
+    h, w = dark.shape
+
+    mask = np.zeros_like(dark, dtype=bool)
+    min_segment_width = int(w * 0.18)
+    min_edge_width = int(w * 0.04)
+    max_gap = int(w * 0.075)
+
+    for y in range(h):
+        xs = np.flatnonzero(dark[y])
+        if xs.size == 0:
+            continue
+
+        start = prev = int(xs[0])
+        dark_count = 1
+        segments = []
+
+        for x in xs[1:]:
+            x = int(x)
+            gap = x - prev - 1
+            if gap <= max_gap:
+                dark_count += 1
+                prev = x
+                continue
+
+            segments.append((start, prev, dark_count))
+            start = prev = x
+            dark_count = 1
+
+        segments.append((start, prev, dark_count))
+
+        for x1, x2, count in segments:
+            width = x2 - x1 + 1
+            touches_edge = x1 <= 12 or x2 >= w - 13
+            is_wide_block = width >= min_segment_width
+            is_edge_block = touches_edge and width >= min_edge_width
+            if (is_wide_block or is_edge_block) and count / width >= 0.42:
+                pad = 8
+                mask[y, max(0, x1 - pad) : min(w, x2 + pad + 1)] = True
+
+    active_rows = mask.any(axis=1)
+    y = 0
+    while y < h:
+        if not active_rows[y]:
+            y += 1
+            continue
+
+        start = y
+        while y < h and active_rows[y]:
+            y += 1
+        end = y
+
+        if end - start < 18:
+            mask[start:end, :] = False
+
+    arr[mask] = 255 - arr[mask]
+    arr = remove_edge_dark_bars(arr, threshold)
+    arr = remove_horizontal_boundary_rules(arr)
+
+    return arr
+
+
+def remove_horizontal_boundary_rules(rgb):
+    arr = rgb.copy()
+    work = rgb.astype(np.float32)
+    luma = 0.2126 * work[:, :, 0] + 0.7152 * work[:, :, 1] + 0.0722 * work[:, :, 2]
+    maxc = rgb.max(axis=2).astype(np.int16)
+    minc = rgb.min(axis=2).astype(np.int16)
+    neutral_line = (luma < 225) & ((maxc - minc) < 22)
+    h, w = neutral_line.shape
+    rows_to_clear = np.zeros(h, dtype=bool)
+
+    for y in range(h):
+        xs = np.flatnonzero(neutral_line[y])
+        if xs.size == 0:
+            continue
+
+        longest = 0
+        start = prev = int(xs[0])
+        for x in xs[1:]:
+            x = int(x)
+            if x == prev + 1:
+                prev = x
+                continue
+            longest = max(longest, prev - start + 1)
+            start = prev = x
+        longest = max(longest, prev - start + 1)
+
+        if longest >= int(w * 0.62) or neutral_line[y].mean() >= 0.48:
+            rows_to_clear[max(0, y - 2) : min(h, y + 3)] = True
+
+    arr[rows_to_clear, :] = [255, 255, 255]
+    return arr
+
+
+def crop_vertical_whitespace(rgb, margin=80):
+    work = rgb.astype(np.float32)
+    luma = 0.2126 * work[:, :, 0] + 0.7152 * work[:, :, 1] + 0.0722 * work[:, :, 2]
+    maxc = rgb.max(axis=2).astype(np.int16)
+    minc = rgb.min(axis=2).astype(np.int16)
+    content = (luma < 245) | ((maxc - minc) > 24)
+    rows = np.flatnonzero(content.mean(axis=1) > 0.003)
+    if rows.size == 0:
+        return rgb
+
+    top = max(0, int(rows[0]) - margin)
+    bottom = min(rgb.shape[0], int(rows[-1]) + margin + 1)
+    return rgb[top:bottom, :]
+
+
+def remove_edge_dark_bars(rgb, threshold=70):
+    arr = rgb.copy()
+    work = rgb.astype(np.float32)
+    luma = 0.2126 * work[:, :, 0] + 0.7152 * work[:, :, 1] + 0.0722 * work[:, :, 2]
+    dark = luma < threshold
+    h, w = dark.shape
+
+    max_edge_distance = int(w * 0.18)
+    min_bar_width = max(4, int(w * 0.003))
+    max_bar_width = int(w * 0.16)
+    min_bar_height = max(90, int(h * 0.018))
+
+    for side in ("left", "right"):
+        x_range = range(0, max_edge_distance) if side == "left" else range(w - 1, w - max_edge_distance - 1, -1)
+        for x in x_range:
+            if dark[:, x].mean() < 0.06:
+                continue
+
+            y = 0
+            while y < h:
+                while y < h and not dark[y, x]:
+                    y += 1
+                start = y
+                while y < h and dark[y, x]:
+                    y += 1
+                end = y
+
+                if end - start < min_bar_height:
+                    continue
+
+                y1 = max(0, start - 4)
+                y2 = min(h, end + 4)
+                if side == "left":
+                    left = x
+                    while left > 0 and dark[start:end, left - 1].mean() > 0.18:
+                        left -= 1
+                    right = x
+                    while right + 1 < w and dark[start:end, right + 1].mean() > 0.18:
+                        right += 1
+                else:
+                    left = x
+                    while left > 0 and dark[start:end, left - 1].mean() > 0.18:
+                        left -= 1
+                    right = x
+                    while right + 1 < w and dark[start:end, right + 1].mean() > 0.18:
+                        right += 1
+
+                bar_width = right - left + 1
+                touches_side = left <= max_edge_distance or right >= w - max_edge_distance
+                if min_bar_width <= bar_width <= max_bar_width and touches_side:
+                    pad = 8
+                    arr[y1:y2, max(0, left - pad) : min(w, right + pad + 1)] = [255, 255, 255]
+
+    return remove_tall_dark_rules(arr, threshold)
+
+
+def remove_tall_dark_rules(rgb, threshold=70):
+    arr = rgb.copy()
+    work = rgb.astype(np.float32)
+    luma = 0.2126 * work[:, :, 0] + 0.7152 * work[:, :, 1] + 0.0722 * work[:, :, 2]
+    dark = luma < threshold
+    h, w = dark.shape
+    seen = np.zeros_like(dark, dtype=bool)
+
+    min_height = max(110, int(h * 0.012))
+    max_width = max(18, int(w * 0.025))
+
+    for sy in range(h):
+        for sx in range(w):
+            if seen[sy, sx] or not dark[sy, sx]:
+                continue
+
+            queue = deque([(sy, sx)])
+            seen[sy, sx] = True
+            pixels = []
+            min_y = max_y = sy
+            min_x = max_x = sx
+
+            while queue:
+                y, x = queue.popleft()
+                pixels.append((y, x))
+                if y < min_y:
+                    min_y = y
+                elif y > max_y:
+                    max_y = y
+                if x < min_x:
+                    min_x = x
+                elif x > max_x:
+                    max_x = x
+
+                for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                    if 0 <= ny < h and 0 <= nx < w and not seen[ny, nx] and dark[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+
+            comp_h = max_y - min_y + 1
+            comp_w = max_x - min_x + 1
+            area = len(pixels)
+            fill_ratio = area / float(comp_w * comp_h)
+            center_x = (min_x + max_x) / 2
+            near_page_edge = center_x < w * 0.16 or center_x > w * 0.62
+            is_tall_rule = (
+                near_page_edge
+                and comp_h >= min_height
+                and comp_w <= max_width
+                and comp_h / max(comp_w, 1) >= 8
+                and fill_ratio >= 0.35
+            )
+
+            if is_tall_rule:
+                y1 = max(0, min_y - 4)
+                y2 = min(h, max_y + 5)
+                x1 = max(0, min_x - 6)
+                x2 = min(w, max_x + 7)
+                arr[y1:y2, x1:x2] = [255, 255, 255]
+
+    return remove_edge_dark_artifacts(arr, threshold)
+
+
+def remove_edge_dark_artifacts(rgb, threshold=85):
+    arr = rgb.copy()
+    work = rgb.astype(np.float32)
+    luma = 0.2126 * work[:, :, 0] + 0.7152 * work[:, :, 1] + 0.0722 * work[:, :, 2]
+    maxc = rgb.max(axis=2).astype(np.int16)
+    minc = rgb.min(axis=2).astype(np.int16)
+    dark = (luma < threshold) & ((maxc - minc) < 48)
+    h, w = dark.shape
+    seen = np.zeros_like(dark, dtype=bool)
+
+    for sy in range(h):
+        for sx in range(w):
+            if seen[sy, sx] or not dark[sy, sx]:
+                continue
+
+            queue = deque([(sy, sx)])
+            seen[sy, sx] = True
+            pixels = []
+            min_y = max_y = sy
+            min_x = max_x = sx
+
+            while queue:
+                y, x = queue.popleft()
+                pixels.append((y, x))
+                if y < min_y:
+                    min_y = y
+                elif y > max_y:
+                    max_y = y
+                if x < min_x:
+                    min_x = x
+                elif x > max_x:
+                    max_x = x
+
+                for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                    if 0 <= ny < h and 0 <= nx < w and not seen[ny, nx] and dark[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+
+            comp_h = max_y - min_y + 1
+            comp_w = max_x - min_x + 1
+            area = len(pixels)
+            fill_ratio = area / float(comp_w * comp_h)
+            near_right_edge = max_x >= int(w * 0.78)
+            small_enough = area < int(w * h * 0.004)
+            rule_like = comp_w / max(comp_h, 1) >= 5 or comp_h / max(comp_w, 1) >= 5
+            compact_edge_mark = comp_w <= int(w * 0.15) and comp_h <= int(h * 0.04)
+
+            if near_right_edge and small_enough and fill_ratio > 0.28 and (rule_like or compact_edge_mark):
+                y1 = max(0, min_y - 6)
+                y2 = min(h, max_y + 7)
+                x1 = max(0, min_x - 8)
+                x2 = min(w, max_x + 9)
+                arr[y1:y2, x1:x2] = [255, 255, 255]
+
+    return arr
+
+
 def convert_image(
     source,
     output_image,
@@ -128,9 +418,32 @@ def convert_image(
     white_threshold=190,
     tile_size=24,
     tile_ratio=0.24,
+    invert_regions=False,
+    trim_vertical_whitespace=False,
 ):
     image = Image.open(source).convert("RGB")
     rgb = np.array(image)
+
+    if invert_regions:
+        arr = invert_continuous_dark_regions(rgb, dark_threshold)
+        if trim_vertical_whitespace:
+            arr = crop_vertical_whitespace(arr)
+        processed = Image.fromarray(arr, "RGB")
+        processed.save(output_image, quality=95)
+        width, height = processed.size
+        page_height = round(width * 297 / 210)
+        page_count = math.ceil(height / page_height)
+        pages = []
+
+        for i in range(page_count):
+            top = i * page_height
+            bottom = min(top + page_height, height)
+            page = Image.new("RGB", (width, page_height), "white")
+            page.paste(processed.crop((0, top, width, bottom)), (0, 0))
+            pages.append(page)
+
+        pages[0].save(output_pdf, save_all=True, append_images=pages[1:], resolution=150)
+        return image.size, page_count
 
     dark_panel, dark_pixels, luma = detect_dark_background(
         rgb, dark_threshold, tile_size, tile_ratio
@@ -180,6 +493,16 @@ def main():
     parser.add_argument("--white-threshold", type=int, default=190)
     parser.add_argument("--tile-size", type=int, default=32)
     parser.add_argument("--tile-ratio", type=float, default=0.45)
+    parser.add_argument(
+        "--invert-dark-regions",
+        action="store_true",
+        help="Invert each large continuous dark region instead of only whitening dark pixels.",
+    )
+    parser.add_argument(
+        "--trim-vertical-whitespace",
+        action="store_true",
+        help="Remove large top/bottom whitespace after processing while keeping a print margin.",
+    )
     args = parser.parse_args()
 
     stem = args.source.with_suffix("")
@@ -194,6 +517,8 @@ def main():
         args.white_threshold,
         args.tile_size,
         args.tile_ratio,
+        args.invert_dark_regions,
+        args.trim_vertical_whitespace,
     )
 
     print(f"source: {args.source}")
